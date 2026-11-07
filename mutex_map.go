@@ -1,32 +1,34 @@
 // Package mutexmap provides thread-safe map implementations with fine-grained locking
 // Supports concurrent read and write operations through sync.RWMutex
-// Offers both basic thread-safe map and advanced on-demand loading cache map
+// Offers a basic thread-safe map here, plus an on-demand cache map in the cachemap package
 // Enables safe concurrent access without outside synchronization
 //
 // mutexmap 包提供具有细粒度锁的线程安全 map 实现
 // 通过 sync.RWMutex 支持并发读写操作
-// 提供基础线程安全 map 和高级按需加载缓存 map
+// 本包提供基础线程安全 map，cachemap 包另提供按需缓存 map
 // 无需外部同步即可实现安全的并发访问
 package mutexmap
 
 import (
 	"sync"
-
-	"github.com/yylego/mutexmap/internal/utils"
 )
 
 // Map provides a thread-safe map implementation using sync.RWMutex
 // Supports generic keys (comparable) and values (any)
 // Offers concurrent reads and exclusive writes
 // Implements Getset method with double-checked locking pattern
+// The zero value works with no New, the same as sync.Map, New and NewMap just set the starting size
+// Do not duplicate a Map once used, it holds a mutex
 //
 // Map 提供使用 sync.RWMutex 的线程安全 map 实现
 // 支持泛型键（可比较）和泛型值（任意）
 // 提供并发读操作和独占写操作
 // 实现具有双重检查锁定模式的 Getset 方法
+// 零值可以直接使用，跟 sync.Map 一样，New 和 NewMap 只是设置初始容量
+// 用过之后不要复制 Map，它里面有锁
 type Map[K comparable, V any] struct {
-	mp    map[K]V       // The underlying map storage // 底层 map 存储
-	mutex *sync.RWMutex // RWMutex to manage concurrent access // 用于并发访问控制的读写锁
+	mp    map[K]V      // The underlying map storage, created on the first write when nil // 底层 map 存储，为 nil 时在第一次写入时创建
+	mutex sync.RWMutex // RWMutex to manage concurrent access // 用于并发访问控制的读写锁
 }
 
 // New creates a new thread-safe map with default starting size of 8
@@ -41,16 +43,15 @@ func New[K comparable, V any]() *Map[K, V] {
 }
 
 // NewMap creates a new thread-safe map with the given starting size
-// The cap sets the starting size hint to optimize allocation
+// The size sets the starting size hint to optimize allocation
 // Returns a Map instance sized to fit the expected element count
 //
 // NewMap 创建具有指定初始容量的新线程安全 map
-// cap 参数设置底层 map 的初始大小提示
+// size 参数设置底层 map 的初始大小提示
 // 返回针对预期元素数量优化的 Map 实例
-func NewMap[K comparable, V any](cap int) *Map[K, V] {
+func NewMap[K comparable, V any](size int) *Map[K, V] {
 	return &Map[K, V]{
-		mp:    make(map[K]V, cap), // Create map with the given size // 创建具有初始容量的 map
-		mutex: &sync.RWMutex{},    // Create RWMutex to manage access // 创建用于访问控制的读写锁
+		mp: make(map[K]V, size), // Create map with the given size // 创建具有初始容量的 map
 	}
 }
 
@@ -66,10 +67,8 @@ func NewMap[K comparable, V any](cap int) *Map[K, V] {
 func (a *Map[K, V]) Get(k K) (V, bool) {
 	a.mutex.RLock()         // Acquire read lock for concurrent reads // 获取读锁以进行并发读取
 	defer a.mutex.RUnlock() // Release read lock when done // 完成时释放读锁
-	if v, ok := a.mp[k]; ok {
-		return v, ok
-	}
-	return utils.Zero[V](), false // Return zero value when key not found // 键不存在时返回零值
+	v, ok := a.mp[k]        // An absent ID gives the zero value and false // 键不存在时得到零值和 false
+	return v, ok
 }
 
 // Set inserts a new mapping and updates when the id exists
@@ -84,6 +83,7 @@ func (a *Map[K, V]) Get(k K) (V, bool) {
 func (a *Map[K, V]) Set(k K, v V) {
 	a.mutex.Lock()         // Acquire write lock for exclusive access // 获取写锁以进行独占访问
 	defer a.mutex.Unlock() // Release write lock when done // 完成时释放写锁
+	a.ensureMap()
 	a.mp[k] = v
 }
 
@@ -136,40 +136,37 @@ func (a *Map[K, V]) Range(run func(k K, v V) bool) {
 	}
 }
 
-// CacheStatus represents the result status of a cache operation
-// Indicates if a value was retrieved from cache, computed and set
-//
-// CacheStatus 代表缓存操作的结果状态
-// 指示值是从缓存中获取的还是计算后设置的
-type CacheStatus string
-
-const (
-	CacheGet CacheStatus = "GET" // Value retrieved from existing cache // 从现有缓存中获取的值
-	CacheSet CacheStatus = "SET" // Value computed and stored in cache // 计算后存储到缓存的值
-)
-
 // Getset retrieves the value at the id, computes and stores it when absent
 // Uses double-checked locking pattern to cut down lock contention and skip redundant calculations
-// Returns the value and an enum showing if a new value was created
+// loaded is true when the value was in the map, false when this Getset computed it, the same as sync.Map.LoadOrStore
 //
 // Getset 获取与键关联的值，如果键不存在，则计算并存储新值
 // 使用双重检查锁定模式以减少锁竞争并避免重复计算
-// 它返回值以及一个枚举值，指示是否创建了新值
-func (a *Map[K, V]) Getset(k K, calculate func() V) (v V, status CacheStatus) {
+// 值本来就在 map 里时 loaded 为 true，由这次调用计算出来时为 false，跟 sync.Map.LoadOrStore 一样
+func (a *Map[K, V]) Getset(k K, calculate func() V) (v V, loaded bool) {
 	if v, ok := a.Get(k); ok { // Fast path: read with shared lock // 快速路径：使用共享锁读取
-		return v, CacheGet // Cached value found, return it // 找到缓存值，返回它
+		return v, true // Cached value found, return it // 找到缓存值，返回它
 	}
 	// 读锁释放，启动写锁，但假设有两个线程同时读不到，就都会同时占用写锁。
 	a.mutex.Lock()
 	defer a.mutex.Unlock()
 	// 增加读锁以后二次确认内容是否在 map 里面，这样第二次占用写锁的线程就不会创建新对象。
 	if v, ok := a.mp[k]; ok { // Second check: a concurrent goroutine might have set it // 二次检查：另一个协程可能已设置
-		return v, CacheGet // Value now exists, return it // 值现已存在，返回它
+		return v, true // Value now exists, return it // 值现已存在，返回它
 	}
 	// 当内容确实不在 map 里时，即首次占用写锁时，这才创建新对象，设置到 map 里。
 	v = calculate() // Compute new value within write lock // 在写锁内计算新值
 	// This function might be expensive. If this is a concern, use cachemap package instead.
 	// 这个函数可能耗时较长，如果对此介意，可以使用 cachemap 包。
+	a.ensureMap()
 	a.mp[k] = v
-	return v, CacheSet // New value computed and cached // 新值已计算并缓存
+	return v, false // New value computed and cached // 新值已计算并缓存
+}
+
+// ensureMap creates the underlying map when nil, which happens with the zero value, hold the write lock to use it
+// ensureMap 在底层 map 为 nil 时创建它，零值的 Map 就是这种情况，调用时要持有写锁
+func (a *Map[K, V]) ensureMap() {
+	if a.mp == nil {
+		a.mp = make(map[K]V)
+	}
 }
